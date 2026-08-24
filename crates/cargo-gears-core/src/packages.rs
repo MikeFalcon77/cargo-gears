@@ -8,6 +8,43 @@ use std::path::Path;
 
 use guppy::graph::PackageGraph;
 
+/// Package scope for commands that operate on either the whole workspace or
+/// an explicit, non-empty set of workspace packages.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PackageScope {
+    /// Operate on every package in the workspace.
+    Workspace,
+    /// Operate only on these exact workspace package names.
+    Selected(Vec<String>),
+}
+
+impl PackageScope {
+    /// Create an explicit package scope, rejecting an empty selection.
+    pub fn from_selected(packages: Vec<String>) -> Result<Self> {
+        if packages.is_empty() {
+            anyhow::bail!("explicit package scope cannot be empty");
+        }
+        Ok(Self::Selected(packages))
+    }
+
+    /// Return selected package names, or `None` for whole-workspace scope.
+    #[must_use]
+    pub fn selected(&self) -> Option<&[String]> {
+        match self {
+            Self::Workspace => None,
+            Self::Selected(packages) => Some(packages),
+        }
+    }
+}
+
+fn load_workspace_metadata(workspace_root: &Path) -> Result<cargo_metadata::Metadata> {
+    cargo_metadata::MetadataCommand::new()
+        .manifest_path(workspace_root.join("Cargo.toml"))
+        .no_deps()
+        .exec()
+        .context("failed to load workspace packages for package selection")
+}
+
 fn build_graph(workspace_root: &Path) -> Result<PackageGraph> {
     MetadataCommand::new()
         .manifest_path(workspace_root.join("Cargo.toml"))
@@ -101,11 +138,14 @@ pub fn resolve_workspace_package_specs(
         return Ok(Vec::new());
     }
 
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .manifest_path(workspace_root.join("Cargo.toml"))
-        .no_deps()
-        .exec()
-        .context("failed to load workspace packages for package selection")?;
+    let metadata = load_workspace_metadata(workspace_root)?;
+    resolve_workspace_package_specs_from_metadata(&metadata, specs)
+}
+
+fn resolve_workspace_package_specs_from_metadata(
+    metadata: &cargo_metadata::Metadata,
+    specs: &[String],
+) -> Result<Vec<String>> {
     let workspace_members: BTreeSet<_> = metadata.workspace_members.iter().collect();
     let workspace_packages: Vec<_> = metadata
         .packages
@@ -201,7 +241,15 @@ pub fn packages_for_gears(workspace_root: &Path, gears: &[String]) -> Result<Vec
         return Ok(Vec::new());
     }
 
-    let local_gears = crate::gears_parser::get_module_name_from_crate(Some(workspace_root))?;
+    let metadata = load_workspace_metadata(workspace_root)?;
+    packages_for_gears_from_metadata(&metadata, gears)
+}
+
+fn packages_for_gears_from_metadata(
+    metadata: &cargo_metadata::Metadata,
+    gears: &[String],
+) -> Result<Vec<String>> {
+    let local_gears = crate::gears_parser::get_module_name_from_metadata(metadata)?;
     let requested: BTreeSet<&str> = gears.iter().map(String::as_str).collect();
     let available: BTreeSet<&str> = local_gears.keys().map(String::as_str).collect();
     let missing: Vec<&str> = requested.difference(&available).copied().collect();
@@ -242,11 +290,6 @@ pub fn packages_for_gears(workspace_root: &Path, gears: &[String]) -> Result<Vec
         }
     }
 
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .manifest_path(workspace_root.join("Cargo.toml"))
-        .no_deps()
-        .exec()
-        .context("failed to load workspace packages for gear selection")?;
     let workspace_members: BTreeSet<_> = metadata.workspace_members.iter().collect();
 
     for package in &metadata.packages {
@@ -267,6 +310,31 @@ pub fn packages_for_gears(workspace_root: &Path, gears: &[String]) -> Result<Vec
     }
 
     Ok(package_names.into_iter().collect())
+}
+
+/// Resolve explicit package specifications and gear selectors with one Cargo
+/// metadata invocation.
+///
+/// No selectors produce whole-workspace scope. Any explicit selection must
+/// resolve to at least one exact workspace package name.
+pub fn resolve_workspace_package_scope(
+    workspace_root: &Path,
+    specs: &[String],
+    gears: &[String],
+) -> Result<PackageScope> {
+    if specs.is_empty() && gears.is_empty() {
+        return Ok(PackageScope::Workspace);
+    }
+
+    let metadata = load_workspace_metadata(workspace_root)?;
+    let mut packages = resolve_workspace_package_specs_from_metadata(&metadata, specs)?;
+    for package in packages_for_gears_from_metadata(&metadata, gears)? {
+        if !packages.contains(&package) {
+            packages.push(package);
+        }
+    }
+
+    PackageScope::from_selected(packages)
 }
 
 /// Expand `packages` to include every workspace crate that (transitively)
@@ -315,7 +383,10 @@ pub fn expand_with_dependents(workspace_root: &Path, packages: &[String]) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_with_dependents, packages_for_gears, resolve_workspace_package_specs};
+    use super::{
+        PackageScope, expand_with_dependents, packages_for_gears, resolve_workspace_package_scope,
+        resolve_workspace_package_specs,
+    };
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -457,6 +528,79 @@ pub struct FileParser;
     }
 
     #[test]
+    fn bare_star_glob_selects_every_workspace_package() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(temp.path());
+
+        let packages = resolve_workspace_package_specs(temp.path(), &["*".to_owned()])
+            .expect("resolve all-package glob");
+
+        assert_eq!(packages, vec!["leaf", "mid", "other", "top"]);
+    }
+
+    #[test]
+    fn no_selectors_produce_workspace_scope_without_loading_metadata() {
+        let temp = TempDir::new().expect("temp dir");
+
+        let scope = resolve_workspace_package_scope(temp.path(), &[], &[])
+            .expect("resolve whole-workspace scope");
+
+        assert_eq!(scope, PackageScope::Workspace);
+    }
+
+    #[test]
+    fn explicit_scope_rejects_an_empty_package_set() {
+        let error = PackageScope::from_selected(Vec::new())
+            .expect_err("empty explicit package scope should fail");
+
+        assert_eq!(error.to_string(), "explicit package scope cannot be empty");
+    }
+
+    #[test]
+    fn explicit_glob_remains_a_selected_scope() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(temp.path());
+
+        let scope = resolve_workspace_package_scope(temp.path(), &["*".to_owned()], &[])
+            .expect("resolve explicit all-package glob");
+
+        assert_eq!(
+            scope,
+            PackageScope::Selected(vec![
+                "leaf".to_owned(),
+                "mid".to_owned(),
+                "other".to_owned(),
+                "top".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn all_package_glob_with_dependents_stays_sorted_and_deduplicated() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(temp.path());
+        let scope = resolve_workspace_package_scope(temp.path(), &["*".to_owned()], &[])
+            .expect("resolve explicit all-package glob");
+        let selected = scope.selected().expect("scope should be explicit");
+
+        let expanded = expand_with_dependents(temp.path(), selected)
+            .expect("expand all explicitly selected packages");
+
+        assert_eq!(expanded, vec!["leaf", "mid", "other", "top"]);
+    }
+
+    #[test]
+    fn unmatched_explicit_scope_is_rejected_instead_of_linting_the_workspace() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(temp.path());
+
+        let error = resolve_workspace_package_scope(temp.path(), &["unknown".to_owned()], &[])
+            .expect_err("unmatched explicit scope should fail");
+
+        assert!(error.to_string().contains("unknown"), "error was: {error}");
+    }
+
+    #[test]
     fn unknown_or_mismatched_package_specs_are_rejected() {
         let temp = TempDir::new().expect("temp dir");
         write_workspace(temp.path());
@@ -466,6 +610,28 @@ pub struct FileParser;
                 .expect_err("package spec should fail");
             assert!(err.to_string().contains(spec), "error was: {err}");
         }
+    }
+
+    #[test]
+    fn combined_package_and_gear_selection_is_resolved_together() {
+        let temp = TempDir::new().expect("temp dir");
+        write_gear_workspace(temp.path());
+
+        let scope = resolve_workspace_package_scope(
+            temp.path(),
+            &["other@0.1".to_owned()],
+            &["file-parser".to_owned()],
+        )
+        .expect("resolve combined package and gear selection");
+
+        assert_eq!(
+            scope,
+            PackageScope::Selected(vec![
+                "other".to_owned(),
+                "cf-file-parser".to_owned(),
+                "cf-file-parser-sdk".to_owned(),
+            ])
+        );
     }
 
     #[test]

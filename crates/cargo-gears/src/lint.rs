@@ -68,7 +68,7 @@ impl LintArgs {
                 strict: false,
                 dylint: self.dylint || self.all,
                 dylint_skip: Vec::new(),
-                packages: Vec::new(),
+                package_scope: cargo_gears_core::packages::PackageScope::Workspace,
                 include_dependents: false,
                 locked: false,
                 features: cargo_gears_core::lint::LintFeatureSelection::Default,
@@ -110,14 +110,11 @@ impl LintArgs {
             .as_ref()
             .map_or_else(Vec::new, |d| d.skip.clone());
 
-        let mut packages = self.package;
-        for package in
-            cargo_gears_core::packages::packages_for_gears(&resolved.workspace_root, &self.gear)?
-        {
-            if !packages.contains(&package) {
-                packages.push(package);
-            }
-        }
+        let package_scope = cargo_gears_core::packages::resolve_workspace_package_scope(
+            &resolved.workspace_root,
+            &self.package,
+            &self.gear,
+        )?;
 
         Ok(cargo_gears_core::lint::LintParams {
             workspace_root: resolved.workspace_root,
@@ -126,7 +123,7 @@ impl LintArgs {
             strict: self.strict,
             dylint,
             dylint_skip,
-            packages,
+            package_scope,
             include_dependents: self.include_dependents,
             locked: self.locked,
             features: feature_selection(self.features, self.all_features, self.no_default_features),
@@ -167,6 +164,7 @@ fn feature_selection(
 mod tests {
     use super::LintArgs;
     use cargo_gears_core::lint::LintFeatureSelection;
+    use cargo_gears_core::packages::PackageScope;
     use clap::Parser;
     use std::fs;
     use tempfile::TempDir;
@@ -188,6 +186,23 @@ mod tests {
         fs::write(temp.path().join("Gears.toml"), manifest).expect("write manifest");
         fs::create_dir_all(temp.path().join("config")).expect("create config dir");
         fs::write(temp.path().join("config/app-dev.yml"), "server: {}\n").expect("write config");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crate-a\", \"crate-b\"]\n",
+        )
+        .expect("write Cargo workspace");
+        for package in ["crate-a", "crate-b"] {
+            let package_dir = temp.path().join(package);
+            fs::create_dir_all(package_dir.join("src")).expect("create package source");
+            fs::write(
+                package_dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                ),
+            )
+            .expect("write package manifest");
+            fs::write(package_dir.join("src/lib.rs"), "").expect("write package source");
+        }
     }
 
     const MINIMAL: &str = "[apps.app.dev]\nconfig = \"app-dev.yml\"\ngears = []\n";
@@ -333,13 +348,13 @@ mod tests {
     }
 
     #[test]
-    fn packages_default_to_empty() {
+    fn packages_default_to_workspace_scope() {
         let temp = TempDir::new().expect("temp dir");
         write_workspace(&temp, MINIMAL);
 
         let resolved = parse(&temp, &["--clippy"]).resolve().expect("resolve");
 
-        assert!(resolved.packages.is_empty());
+        assert_eq!(resolved.package_scope, PackageScope::Workspace);
     }
 
     #[test]
@@ -354,7 +369,10 @@ mod tests {
         .resolve()
         .expect("resolve");
 
-        assert_eq!(resolved.packages, vec!["crate-a", "crate-b"]);
+        assert_eq!(
+            resolved.package_scope,
+            PackageScope::Selected(vec!["crate-a".to_owned(), "crate-b".to_owned()])
+        );
     }
 
     #[test]
@@ -406,7 +424,10 @@ mod tests {
         .expect("resolve");
 
         assert!(resolved.include_dependents);
-        assert_eq!(resolved.packages, vec!["crate-a"]);
+        assert_eq!(
+            resolved.package_scope,
+            PackageScope::Selected(vec!["crate-a".to_owned()])
+        );
     }
 
     #[test]
@@ -457,8 +478,11 @@ edition = "2021"
             .expect("resolve");
 
         assert_eq!(
-            resolved.packages,
-            vec!["cf-file-parser", "cf-file-parser-sdk"]
+            resolved.package_scope,
+            PackageScope::Selected(vec![
+                "cf-file-parser".to_owned(),
+                "cf-file-parser-sdk".to_owned(),
+            ])
         );
     }
 
@@ -578,6 +602,9 @@ edition = "2021"
             .expect("resolve");
 
         assert!(resolved.dylint);
-        assert_eq!(resolved.packages, vec!["crate-a"]);
+        assert_eq!(
+            resolved.package_scope,
+            PackageScope::Selected(vec!["crate-a".to_owned()])
+        );
     }
 }

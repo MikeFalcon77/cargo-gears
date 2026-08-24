@@ -1029,7 +1029,8 @@ Arguments:
 - **[`--dylint`]** Runs the embedded `cargo-gears-lints` Dylint rules against the workspace rooted at the current or selected
   directory
 - **[`-P, --package <SPEC>`]** Restricts formatting, Clippy, and Dylint to the given workspace package(s); repeatable.
-  When omitted together with `--gear`, the whole workspace is linted.
+  Supports Cargo package ID specifications and package-name globs such as `cf-gears-*`. When omitted together with
+  `--gear`, the whole workspace is linted.
 - **[`--gear <NAME>`]** Restricts formatting, Clippy, and Dylint to the local workspace package(s) belonging to a
   discovered gear; repeatable. Includes the conventional nested gear SDK package. Use `cargo gears ls gears --local` to
   list valid names. Can be combined with `-P/--package`.
@@ -1063,8 +1064,8 @@ Behavior:
 - **[workspace-scoped dylint]** Dylint receives the resolved workspace manifest path, so `-p/--path` is the way to lint
   another workspace without manually changing directories
 - **[package-scoped linting]** Passing one or more `-P/--package <SPEC>` flags restricts formatting, Clippy, and Dylint
-  to those packages instead of the whole workspace; the flag is repeatable and package specs follow cargo's `-p`
-  selector syntax.
+  to those packages instead of the whole workspace; the flag is repeatable and supports Cargo package ID specifications
+  plus package-name globs. A bare `*` intentionally selects every workspace package while remaining an explicit scope.
 - **[gear-scoped linting]** Each `--gear <NAME>` is resolved through local workspace gear discovery to its annotated
   package and conventional nested SDK workspace package, when present. Gear-derived packages are merged and
   de-duplicated with explicit `-P/--package` selections. System registry gears that are not local workspace members

@@ -30,26 +30,33 @@ pub fn get_module_name_from_crate(
     if let Some(dir) = workspace_dir {
         cmd.current_dir(dir);
     }
-    let res = cmd.exec().context("failed to run cargo metadata")?;
+    let metadata = cmd.exec().context("failed to run cargo metadata")?;
+    get_module_name_from_metadata(&metadata)
+}
+
+/// Discover local gears from an existing Cargo metadata result.
+pub fn get_module_name_from_metadata(
+    metadata: &cargo_metadata::Metadata,
+) -> anyhow::Result<HashMap<String, ConfigModule>> {
     let mut members: HashMap<String, ConfigModule> = HashMap::new();
-    for pkg in res.packages {
-        for t in &pkg.targets {
-            if is_library_target(t) && !t.name.ends_with("sdk") {
-                match super::module_rs::retrieve_gears_module(&pkg, t) {
+    for package in &metadata.packages {
+        for target in &package.targets {
+            if is_library_target(target) && !target.name.ends_with("sdk") {
+                match super::module_rs::retrieve_gears_module(package, target) {
                     Ok((name, module)) => {
                         if let Some(existing) = members.get(&name) {
                             let existing_package =
                                 existing.metadata.package.as_deref().unwrap_or("<unknown>");
                             anyhow::bail!(
                                 "duplicate gear name `{name}` declared by packages `{existing_package}` and `{}`",
-                                pkg.name
+                                package.name
                             );
                         }
                         members.insert(name, module);
                     }
-                    Err(e) if e.is::<NotFoundError>() => {}
-                    Err(e) => {
-                        eprintln!("{e}");
+                    Err(error) if error.is::<NotFoundError>() => {}
+                    Err(error) => {
+                        eprintln!("{error}");
                     }
                 }
             }

@@ -309,7 +309,7 @@ Options:
 - `--clippy` — run workspace Clippy
 - `--strict` — turn Clippy warnings into errors (requires `--clippy` or `--all`)
 - `--dylint` — run embedded Dylint rules (requires the `dylint-rules` feature)
-- `-P, --package <SPEC>` — restrict formatting, Clippy, and Dylint to specific workspace package(s); repeatable. When omitted together with `--gear`, the whole workspace is linted.
+- `-P, --package <SPEC>` — restrict formatting, Clippy, and Dylint to specific workspace package(s); repeatable. Supports Cargo package ID specifications and package-name globs such as `cf-gears-*`; a bare `*` explicitly selects every workspace package. When omitted together with `--gear`, the whole workspace is linted.
 - `--gear <NAME>` — restrict formatting, Clippy, and Dylint to the local workspace package(s) belonging to a discovered gear; repeatable. Includes the conventional nested gear SDK package. Use `cargo gears ls gears --local` to list valid names.
 - `--include-dependents` — expand `-P/--package` and `--gear` selections to also include every workspace crate that (transitively) depends on the selected package(s), i.e. their reverse-dependency closure. Requires at least one package or gear selection; otherwise the command fails. The expanded scope applies to formatting, Clippy, and Dylint.
 - `-F, --features <FEATURES>` — enable Cargo features for Clippy and Dylint; accepts comma-separated values and is repeatable. Default features remain enabled unless `--no-default-features` is passed.

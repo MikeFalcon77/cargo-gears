@@ -1,4 +1,5 @@
 use crate::common::cargo_cmd;
+use crate::packages::PackageScope;
 use anyhow::{Context, Result};
 
 #[cfg(feature = "dylint-rules")]
@@ -36,9 +37,9 @@ pub struct LintParams {
     pub dylint: bool,
     /// Lint names to skip when running dylint.
     pub dylint_skip: Vec<String>,
-    /// Restrict linting to these packages. Empty means the whole workspace.
-    pub packages: Vec<String>,
-    /// Expand `packages` to also include every workspace crate that depends on
+    /// Workspace-wide or explicitly selected package scope.
+    pub package_scope: PackageScope,
+    /// Expand explicitly selected packages to also include every workspace crate that depends on
     /// them (their reverse-dependency closure) before linting.
     pub include_dependents: bool,
     /// Require Cargo.lock is up to date.
@@ -285,17 +286,17 @@ impl LintParams {
             return Ok(());
         }
 
-        let packages = self.effective_packages()?;
+        let package_scope = self.effective_package_scope()?;
 
         if self.fmt {
-            run_fmt(&self.workspace_root, &packages)?;
+            run_fmt(&self.workspace_root, &package_scope)?;
         }
 
         if self.clippy {
             run_clippy(
                 &self.workspace_root,
                 self.strict,
-                &packages,
+                &package_scope,
                 self.locked,
                 &self.features,
             )?;
@@ -305,7 +306,7 @@ impl LintParams {
             run_dylint(
                 &self.workspace_root,
                 &self.dylint_skip,
-                &packages,
+                &package_scope,
                 self.locked,
                 &self.features,
             )?;
@@ -314,15 +315,16 @@ impl LintParams {
         Ok(())
     }
 
-    /// Resolve the package set to lint, applying reverse-dependency expansion
-    /// when `include_dependents` is set and at least one package was selected.
-    fn effective_packages(&self) -> Result<Vec<String>> {
-        let packages =
-            crate::packages::resolve_workspace_package_specs(&self.workspace_root, &self.packages)?;
-        if self.include_dependents && !packages.is_empty() {
-            crate::packages::expand_with_dependents(&self.workspace_root, &packages)
-        } else {
-            Ok(packages)
+    /// Apply reverse-dependency expansion to an explicit package scope.
+    fn effective_package_scope(&self) -> Result<PackageScope> {
+        match &self.package_scope {
+            PackageScope::Workspace => Ok(PackageScope::Workspace),
+            PackageScope::Selected(packages) if self.include_dependents => {
+                let packages =
+                    crate::packages::expand_with_dependents(&self.workspace_root, packages)?;
+                PackageScope::from_selected(packages)
+            }
+            PackageScope::Selected(packages) => PackageScope::from_selected(packages.clone()),
         }
     }
 }
@@ -357,9 +359,9 @@ fn list_lints(dylint_only: bool) {
     }
 }
 
-fn run_fmt(workspace_path: &Path, packages: &[String]) -> Result<()> {
+fn run_fmt(workspace_path: &Path, package_scope: &PackageScope) -> Result<()> {
     let mut cmd = cargo_cmd()?;
-    cmd.args(fmt_cargo_args(packages));
+    cmd.args(fmt_cargo_args(package_scope));
     cmd.current_dir(workspace_path);
 
     let status = cmd.status().context("failed to run `cargo fmt --check`")?;
@@ -370,13 +372,14 @@ fn run_fmt(workspace_path: &Path, packages: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn fmt_cargo_args(packages: &[String]) -> Vec<String> {
+fn fmt_cargo_args(package_scope: &PackageScope) -> Vec<String> {
     let mut args = vec!["fmt".to_owned(), "--check".to_owned()];
-    if packages.is_empty() {
-        args.push("--all".to_owned());
-    } else {
-        for package in packages {
-            args.extend(["--package".to_owned(), package.clone()]);
+    match package_scope {
+        PackageScope::Workspace => args.push("--all".to_owned()),
+        PackageScope::Selected(packages) => {
+            for package in packages {
+                args.extend(["--package".to_owned(), package.clone()]);
+            }
         }
     }
     args
@@ -385,17 +388,20 @@ fn fmt_cargo_args(packages: &[String]) -> Vec<String> {
 fn run_clippy(
     workspace_path: &Path,
     strict: bool,
-    packages: &[String],
+    package_scope: &PackageScope,
     locked: bool,
     features: &LintFeatureSelection,
 ) -> Result<()> {
     let mut cmd = cargo_cmd()?;
     cmd.arg("clippy");
-    if packages.is_empty() {
-        cmd.arg("--workspace");
-    } else {
-        for package in packages {
-            cmd.args(["--package", package]);
+    match package_scope {
+        PackageScope::Workspace => {
+            cmd.arg("--workspace");
+        }
+        PackageScope::Selected(packages) => {
+            for package in packages {
+                cmd.args(["--package", package]);
+            }
         }
     }
     cmd.arg("--all-targets");
@@ -438,7 +444,7 @@ fn embedded_toolchains() -> Result<BTreeSet<String>> {
 fn run_dylint(
     workspace_path: &Path,
     skipped_lints: &[String],
-    packages: &[String],
+    package_scope: &PackageScope,
     locked: bool,
     features: &LintFeatureSelection,
 ) -> Result<()> {
@@ -485,8 +491,8 @@ fn run_dylint(
             },
             // Lint the whole workspace unless specific packages were requested
             // on the command line, in which case only those are checked.
-            workspace: packages.is_empty(),
-            packages: packages.to_vec(),
+            workspace: matches!(package_scope, PackageScope::Workspace),
+            packages: package_scope.selected().unwrap_or_default().to_vec(),
             args: dylint_cargo_check_args(skipped_lints, locked, features)?,
             ..Default::default()
         }),
@@ -555,7 +561,7 @@ fn clear_dylint_rustc_info_cache(workspace_path: &Path, toolchain: &str) -> Resu
 fn run_dylint(
     _workspace_path: &Path,
     _skipped_lints: &[String],
-    _packages: &[String],
+    _package_scope: &PackageScope,
     _locked: bool,
     _features: &LintFeatureSelection,
 ) -> Result<()> {
@@ -565,6 +571,7 @@ fn run_dylint(
 #[cfg(test)]
 mod tests {
     use super::{DYLINT_LINTS, LintFeatureSelection};
+    use crate::packages::PackageScope;
 
     #[cfg(feature = "dylint-rules")]
     #[test]
@@ -591,13 +598,19 @@ mod tests {
 
     #[test]
     fn fmt_uses_all_packages_without_a_package_selection() {
-        assert_eq!(super::fmt_cargo_args(&[]), ["fmt", "--check", "--all"]);
+        assert_eq!(
+            super::fmt_cargo_args(&PackageScope::Workspace),
+            ["fmt", "--check", "--all"]
+        );
     }
 
     #[test]
     fn fmt_uses_each_selected_package() {
         assert_eq!(
-            super::fmt_cargo_args(&["crate-a".to_owned(), "crate-b".to_owned()]),
+            super::fmt_cargo_args(&PackageScope::Selected(vec![
+                "crate-a".to_owned(),
+                "crate-b".to_owned(),
+            ])),
             [
                 "fmt",
                 "--check",
