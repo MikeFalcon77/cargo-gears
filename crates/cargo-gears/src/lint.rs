@@ -10,7 +10,7 @@ pub struct LintArgs {
     workspace: WorkspacePath,
     #[command(flatten)]
     manifest: ManifestTargetArgs,
-    /// Check whether the workspace is formatted with `cargo fmt`.
+    /// Check formatting for the selected package scope with `cargo fmt`.
     #[arg(long)]
     fmt: bool,
     /// Run recommended clippy rules. Follows Cargo.toml exceptions if present.
@@ -23,16 +23,29 @@ pub struct LintArgs {
     #[arg(long)]
     dylint: bool,
     /// Restrict linting to specific workspace package(s). Repeatable.
-    /// When omitted, the whole workspace is linted.
+    /// When omitted together with `--gear`, the whole workspace is linted.
     #[arg(short = 'P', long = "package", value_name = "SPEC")]
     package: Vec<String>,
+    /// Restrict linting to the local workspace package(s) belonging to a gear.
+    /// Includes the conventional nested gear SDK package. Repeatable.
+    #[arg(long = "gear", value_name = "NAME")]
+    gear: Vec<String>,
     /// Also lint every workspace crate that depends on the selected package(s).
-    /// Requires at least one `-P/--package`; expands to the reverse-dependency closure.
+    /// Requires `-P/--package` or `--gear`; expands to the reverse-dependency closure.
     #[arg(long = "include-dependents")]
     include_dependents: bool,
     /// Require Cargo.lock is up to date
     #[arg(long, action = clap::ArgAction::SetTrue)]
     locked: bool,
+    /// Enable specific Cargo features. Accepts comma-separated values and is repeatable.
+    #[arg(short = 'F', long, value_name = "FEATURES", value_delimiter = ',')]
+    features: Vec<String>,
+    /// Enable all Cargo features.
+    #[arg(long, conflicts_with_all = ["features", "no_default_features"])]
+    all_features: bool,
+    /// Disable Cargo default features. Can be combined with `--features`.
+    #[arg(long, conflicts_with = "all_features")]
+    no_default_features: bool,
     /// List available lint rules instead of running them.
     /// Combine with `--dylint` to list only dylint rules.
     #[arg(long)]
@@ -55,11 +68,18 @@ impl LintArgs {
                 strict: false,
                 dylint: self.dylint || self.all,
                 dylint_skip: Vec::new(),
-                packages: Vec::new(),
+                package_scope: cargo_gears_core::packages::PackageScope::Workspace,
                 include_dependents: false,
                 locked: false,
+                features: cargo_gears_core::lint::LintFeatureSelection::Default,
                 list: true,
             });
+        }
+
+        if self.include_dependents && self.package.is_empty() && self.gear.is_empty() {
+            anyhow::bail!(
+                "`--include-dependents` requires at least one `-P/--package` or `--gear`"
+            );
         }
 
         let workspace_path =
@@ -90,6 +110,12 @@ impl LintArgs {
             .as_ref()
             .map_or_else(Vec::new, |d| d.skip.clone());
 
+        let package_scope = cargo_gears_core::packages::resolve_workspace_package_scope(
+            &resolved.workspace_root,
+            &self.package,
+            &self.gear,
+        )?;
+
         Ok(cargo_gears_core::lint::LintParams {
             workspace_root: resolved.workspace_root,
             fmt,
@@ -97,17 +123,48 @@ impl LintArgs {
             strict: self.strict,
             dylint,
             dylint_skip,
-            packages: self.package,
+            package_scope,
             include_dependents: self.include_dependents,
             locked: self.locked,
+            features: feature_selection(self.features, self.all_features, self.no_default_features),
             list: false,
         })
+    }
+}
+
+fn feature_selection(
+    features: Vec<String>,
+    all_features: bool,
+    no_default_features: bool,
+) -> cargo_gears_core::lint::LintFeatureSelection {
+    if all_features {
+        return cargo_gears_core::lint::LintFeatureSelection::All;
+    }
+
+    let features = features
+        .into_iter()
+        .fold(Vec::new(), |mut unique, feature| {
+            if !unique.contains(&feature) {
+                unique.push(feature);
+            }
+            unique
+        });
+
+    if features.is_empty() && !no_default_features {
+        cargo_gears_core::lint::LintFeatureSelection::Default
+    } else {
+        cargo_gears_core::lint::LintFeatureSelection::Selected {
+            features,
+            no_default_features,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::LintArgs;
+    use cargo_gears_core::lint::LintFeatureSelection;
+    use cargo_gears_core::packages::PackageScope;
     use clap::Parser;
     use std::fs;
     use tempfile::TempDir;
@@ -129,6 +186,23 @@ mod tests {
         fs::write(temp.path().join("Gears.toml"), manifest).expect("write manifest");
         fs::create_dir_all(temp.path().join("config")).expect("create config dir");
         fs::write(temp.path().join("config/app-dev.yml"), "server: {}\n").expect("write config");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crate-a\", \"crate-b\"]\n",
+        )
+        .expect("write Cargo workspace");
+        for package in ["crate-a", "crate-b"] {
+            let package_dir = temp.path().join(package);
+            fs::create_dir_all(package_dir.join("src")).expect("create package source");
+            fs::write(
+                package_dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                ),
+            )
+            .expect("write package manifest");
+            fs::write(package_dir.join("src/lib.rs"), "").expect("write package source");
+        }
     }
 
     const MINIMAL: &str = "[apps.app.dev]\nconfig = \"app-dev.yml\"\ngears = []\n";
@@ -274,13 +348,13 @@ mod tests {
     }
 
     #[test]
-    fn packages_default_to_empty() {
+    fn packages_default_to_workspace_scope() {
         let temp = TempDir::new().expect("temp dir");
         write_workspace(&temp, MINIMAL);
 
         let resolved = parse(&temp, &["--clippy"]).resolve().expect("resolve");
 
-        assert!(resolved.packages.is_empty());
+        assert_eq!(resolved.package_scope, PackageScope::Workspace);
     }
 
     #[test]
@@ -295,7 +369,34 @@ mod tests {
         .resolve()
         .expect("resolve");
 
-        assert_eq!(resolved.packages, vec!["crate-a", "crate-b"]);
+        assert_eq!(
+            resolved.package_scope,
+            PackageScope::Selected(vec!["crate-a".to_owned(), "crate-b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn include_dependents_requires_a_package_or_gear() {
+        let cli = TestCli::try_parse_from([
+            "gears",
+            "--app",
+            "app1",
+            "--env",
+            "dev",
+            "--clippy",
+            "--include-dependents",
+        ])
+        .expect("arguments should parse");
+
+        let err = cli
+            .lint
+            .resolve()
+            .expect_err("include-dependents without seeds should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "`--include-dependents` requires at least one `-P/--package` or `--gear`"
+        );
     }
 
     #[test]
@@ -323,7 +424,172 @@ mod tests {
         .expect("resolve");
 
         assert!(resolved.include_dependents);
-        assert_eq!(resolved.packages, vec!["crate-a"]);
+        assert_eq!(
+            resolved.package_scope,
+            PackageScope::Selected(vec!["crate-a".to_owned()])
+        );
+    }
+
+    #[test]
+    fn gear_selector_resolves_implementation_and_sdk_packages() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(&temp, MINIMAL);
+        fs::create_dir_all(temp.path().join("gears/file-parser/src")).expect("create gear source");
+        fs::create_dir_all(temp.path().join("gears/file-parser/sdk/src"))
+            .expect("create sdk source");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            r#"[workspace]
+resolver = "2"
+members = ["gears/file-parser", "gears/file-parser/sdk"]
+"#,
+        )
+        .expect("write workspace manifest");
+        fs::write(
+            temp.path().join("gears/file-parser/Cargo.toml"),
+            r#"[package]
+name = "cf-file-parser"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("write gear manifest");
+        fs::write(
+            temp.path().join("gears/file-parser/src/lib.rs"),
+            r#"#[toolkit::gear(name = "file-parser")]
+pub struct FileParser;
+"#,
+        )
+        .expect("write gear source");
+        fs::write(
+            temp.path().join("gears/file-parser/sdk/Cargo.toml"),
+            r#"[package]
+name = "cf-file-parser-sdk"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("write sdk manifest");
+        fs::write(temp.path().join("gears/file-parser/sdk/src/lib.rs"), "")
+            .expect("write sdk source");
+
+        let resolved = parse(&temp, &["--clippy", "--gear", "file-parser"])
+            .resolve()
+            .expect("resolve");
+
+        assert_eq!(
+            resolved.package_scope,
+            PackageScope::Selected(vec![
+                "cf-file-parser".to_owned(),
+                "cf-file-parser-sdk".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn repeated_gear_flags_are_collected() {
+        let cli = TestCli::try_parse_from([
+            "gears",
+            "--app",
+            "app1",
+            "--env",
+            "dev",
+            "--gear",
+            "file-parser",
+            "--gear",
+            "api-gateway",
+        ])
+        .expect("gear flags should parse");
+
+        assert_eq!(cli.lint.gear, vec!["file-parser", "api-gateway"]);
+    }
+
+    #[test]
+    fn features_default_to_package_defaults() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(&temp, MINIMAL);
+
+        let resolved = parse(&temp, &["--clippy"]).resolve().expect("resolve");
+
+        assert_eq!(resolved.features, LintFeatureSelection::Default);
+    }
+
+    #[test]
+    fn repeated_and_comma_separated_features_are_collected() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(&temp, MINIMAL);
+
+        let resolved = parse(
+            &temp,
+            &[
+                "--clippy",
+                "--features",
+                "otel,metrics",
+                "-F",
+                "sqlite",
+                "-F",
+                "otel",
+            ],
+        )
+        .resolve()
+        .expect("resolve");
+
+        assert_eq!(
+            resolved.features,
+            LintFeatureSelection::Selected {
+                features: vec!["otel".to_owned(), "metrics".to_owned(), "sqlite".to_owned()],
+                no_default_features: false,
+            }
+        );
+    }
+
+    #[test]
+    fn no_default_features_can_be_combined_with_selected_features() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(&temp, MINIMAL);
+
+        let resolved = parse(
+            &temp,
+            &["--dylint", "--no-default-features", "-F", "sqlite"],
+        )
+        .resolve()
+        .expect("resolve");
+
+        assert_eq!(
+            resolved.features,
+            LintFeatureSelection::Selected {
+                features: vec!["sqlite".to_owned()],
+                no_default_features: true,
+            }
+        );
+    }
+
+    #[test]
+    fn all_features_is_threaded() {
+        let temp = TempDir::new().expect("temp dir");
+        write_workspace(&temp, MINIMAL);
+
+        let resolved = parse(&temp, &["--clippy", "--all-features"])
+            .resolve()
+            .expect("resolve");
+
+        assert_eq!(resolved.features, LintFeatureSelection::All);
+    }
+
+    #[test]
+    fn all_features_conflicts_with_specific_features() {
+        let result = TestCli::try_parse_from([
+            "gears",
+            "--app",
+            "app1",
+            "--env",
+            "dev",
+            "--all-features",
+            "--features",
+            "otel",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -336,6 +602,9 @@ mod tests {
             .expect("resolve");
 
         assert!(resolved.dylint);
-        assert_eq!(resolved.packages, vec!["crate-a"]);
+        assert_eq!(
+            resolved.package_scope,
+            PackageScope::Selected(vec!["crate-a".to_owned()])
+        );
     }
 }
